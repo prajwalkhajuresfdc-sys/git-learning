@@ -1,0 +1,1029 @@
+/**
+* @File Name : LeadPushContaque.cls
+* @Description : lead push to dialer -- integration with dialer in order to send lead data to dialer
+* @Author :
+* @Last Modified By :
+* @Last Modified On : 7/10/2024
+* @Modification Log :
+* @Test class : LeadPushContaqueTest
+*==============================================================================
+* Ver | Date | Author | Modification
+*==============================================================================
+* 1.0 |               |   | Initial Version
+* 1.1 | 07/10/2024 | Prajwal | Added future method reEnquirePush()
+* 1.2 | | Scideas | Added email alert
+* 1.3 |16-12-2024  |Scideas| Added reenquire date population
+* 1.4 |09-07-2025  |Scideas|   '151003'  course excluded
+* 1.5 | 16-09 -2025 | Verve changes added
+**/
+global class LeadPushContaque {
+
+
+    @future(callout=true)
+    global static void pushLeads(LIST<Id> leads){
+        LeadPushContaque.pushLeadsProcess(leads);
+    }
+
+    @future(callout=true)
+    global static void pushLeads2(LIST<Id> leads){
+        //get configuration data
+        All_Configuration_details__c configdata = All_Configuration_details__c.getOrgDefaults();
+        String AcademicYear = configdata.Current_Appliyng_Year__c;
+
+
+        String endpintUrl;
+        String username;
+        String password;
+        //added under verve
+        if([SELECT IsSandbox FROM Organization LIMIT 1].IsSandbox){
+            endpintUrl = configdata.Dialer_Sand_bulk_lead_push_endp__c;
+            username=configdata.Dialer_Sandb_Verve_Username__c;
+            password=configdata.Dialer_Sandb_Verve_Pass__c;
+
+        }else//prod
+        {
+            endpintUrl = configdata.Dialer_Prod_bulk_lead_push_endp__c;
+            username=configdata.Dialer_User_Name_Prod__c;
+            password=configdata.Dialer_Password_Prod__c;
+
+        }
+
+        system.debug(leads);
+        recordtype upes =[select id from recordtype where sobjecttype='lead' and developername='upes'];
+        Time timeStart = Time.newInstance(9, 0, 0, 0); // 9 am
+        Time timeEnd = Time.newInstance(20, 0, 0, 0); // 8 pm
+        DateTime dtStart = DateTime.newInstance(Date.today(), timeStart);
+        DateTime dtEnd = DateTime.newInstance(Date.today(), timeEnd);
+
+        //Date sunday = Date.newInstance(1900, 1, 7);
+        Log__c activityLogs=new Log__c();
+        activityLogs.Name = 'Lead-Push2';
+
+
+
+        LIST<LeadPushDataToCTI> dataList=new LIST<LeadPushDataToCTI>();
+        Integer callattemt=0;
+        List<Lead> LeadPush = new List<Lead>();
+        LIST<Id> leadsTmp = new LIST<Id>();
+
+        //Start: exclude for partner portal user. 12 July 2023
+        for (Lead l : [Select Student_consent__c,id,CSID__c, Select_Courses__c,PhD_Course__c, (select Created_date_and_time__c,Lead_Source_Name__c, Name,Source_Master__r.Name,Data_Source__c,CreatedDate,Status__c from Duplicate_Lead_Sources__r Where Data_Source__c NOT IN ('BD','Callcentre-Inbound Calls')  order by CreatedDate desc  limit 1  ),
+                       mobilephone,Course_School__c,CreatedDate,status ,Lead_Source_1__c, data_source__c,Data_Source1__c, First_Source__c,
+                       Salesforce_Created_Date_and_Time__c,Lead_Group__c,Lead_Source2__r.Name,LeadSource,First_Data_Source__c,Lead_Source__r.Data_Source__c
+                       from Lead
+                       where
+                       applying_year__c = :system.label.Academic_Year AND RecordType.DeveloperName='upes'AND id=:leads AND Total_Call_Attempts__c =:callattemt AND Course_Code__c not in ('151003') ]){
+                           // Fetch the SourceMaster record for the First_Source__c value
+                           List<Sub_Sources__c> sourceMasterRecordList = [SELECT Data_Source__c FROM Sub_Sources__c WHERE Name = :l.First_Source__c or Name = :l.LeadSource LIMIT 1];
+                           Sub_Sources__c sourceMasterRecord = new Sub_Sources__c();
+                           boolean sourceExist = false;
+                           system.debug('sourceMasterRecordList..'+sourceMasterRecordList);
+                           if (!sourceMasterRecordList.isEmpty()) {
+                               sourceExist = true;
+                               sourceMasterRecord = sourceMasterRecordList[0];
+                           }
+
+                           // Check if the data source is not 'Partner Portals'
+                           if ((sourceExist && sourceMasterRecord.Data_Source__c != 'Partner Portals') || !sourceExist) {
+                               system.debug('Non-Partner');
+
+                               leadsTmp.add(l.Id);
+                               LeadPush.add(l);
+                           }
+                       }
+        leads = new LIST<Id>();
+        leads.addAll(leadsTmp);
+        //End
+        System.debug('Lead List:::::'+ LeadPush);
+        System.debug('Lead List:::::'+ leads);
+
+
+
+        aggregateresult [] othersources = [Select count(id) cnt,Lead__c  from Duplicate_Lead_Sources__c   Where  Lead__c    in:leads and Lead__r.RecordType.DeveloperName='upes' group by Lead__c]  ;
+
+        //  system.debug('uuu'+othersources.size());
+        set<string> emailset =new set<string>();
+        set<string> mobileset =new set<string>();
+
+        //  list<lead> ldlist1 =[Select id,mobilephone,email,CreatedDate,Course_School__c from lead where (email =:emailset or mobilephone =:mobileset) AND RecordType.DeveloperName='upes'];
+        Lead_Push_Count__c directWebsite = Lead_Push_Count__c.getValues('Direct-Website');
+        Boolean p10 = false,updatecount = false;
+        //list<id> ldidlist   = new list<id>();
+
+        //list<lead> ldlist =[select id  from lead where id =:ldidlist];
+
+        //   Boolean PhdCourse;
+        // if(LeadPush.size()>0)
+        for(Lead ld:LeadPush){
+            //  PhdCourse = ld.PhD_Course__c;            //Added by Aman, Value to this field is updatd via flow
+            //System.debug(' Is Phd Course ? = '+PhdCourse);
+            //  if(PhdCourse == false)
+
+            DateTime dt =ld.createddate;
+
+            String sfdate = dt.format('yyyy-MM-dd HH:mm:ss');
+
+            //     system.debug('sfdate=='+sfdate);
+            String todayDay = dt.format('EEEE');
+            // system.debug('todayDay=='+todayDay);
+            for(Duplicate_Lead_Sources__c dl:ld.Duplicate_Lead_Sources__r){
+
+                //  DateTime dtos=dl.CreatedDate;
+                // String created_date_time = dtos.format('yyyy-MM-dd HH:mm:ss');
+                // system.debug('created date'+created_date_time);
+
+                if( dl.Lead_Source_Name__c == 'WhatsAppCall'){
+
+                    activityLogs.API_Request__c=activityLogs.API_Request__c+'\n'+'Response:::::::{'+'campName:'+ld.Course_School__c+';'+'phone1:'+ld.MobilePhone+','+'listName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c+','+
+                        'skillName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 10').Skill__c+','+'sfdate:'+sfdate+'status:'+dl.Status__c+'lead source:'+dl.Lead_Source_Name__c+'data_source:'+dl.Data_Source__c+'CreatedDate:'+dl.Created_date_and_time__c+'other source name:'+dl.Name+'}';
+                    system.debug('end');
+
+                    dataList.add(new LeadPushDataToCTI((ld.Course_School__c!=null &&
+                                                        ld.Course_School__c!='')?ld.Course_School__c:System.Label.Contaque_Lead_Push_Unknown_School_Campaign, ld.mobilephone.right(10),Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c,Lead_Push_Priority_Levels__c.getInstance('Priority 10').Skill__c,sfdate,dl.Name,dl.Data_Source__c, dl.Created_date_and_time__c,dl.Status__c,dl.Source_Master__r.Name));
+                    system.debug(' dataList'+ dataList);
+                    ld.Posted_date__C=Date.Today();
+                    activityLogs.Activityid__c=Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c;
+                    ld.CTI_Priority__c='p10';
+
+                }
+            }
+
+
+
+
+
+            Http h=new Http();
+            HttpRequest req=new HttpRequest();
+            //req.setEndpoint(System.Label.Contaque_Lead_Push);
+            req.setEndpoint(endpintUrl);
+            req.setMethod('POST');
+            req.setHeader('Content-Type', 'application/json');
+            req.setBody(JSON.serialize(dataList));
+            req.setTimeout(120000);
+            // Set up Basic Authorization header new
+
+            Blob headerValue = Blob.valueOf(username + ':' + password);
+            String authorizationHeader = 'Basic ' + EncodingUtil.base64Encode(headerValue);
+            req.setHeader('Authorization', authorizationHeader);
+
+            try
+            {
+                httpresponse res= h.send(req);
+                if(res.getStatusCode()==200)
+                {
+                    activityLogs.API_Response__c=res.getBody();
+                    insert activityLogs;
+                    update leadPush;
+                    system.debug(leadPush);
+
+                    if(updatecount)
+                        update directWebsite;
+                }
+            }
+            catch(Exception e)
+            {
+                activityLogs.API_Response__c=e.getMessage();
+                insert activityLogs;
+
+
+            }
+
+        }
+
+    }
+
+    @future(callout=true)
+    global static void pushLeads1(LIST<Id> leads){
+        //get configuration data
+        All_Configuration_details__c configdata = All_Configuration_details__c.getOrgDefaults();
+        String AcademicYear = configdata.Current_Appliyng_Year__c;
+
+        String endpintUrl;
+        String username;
+        String password;
+        //added under verve
+        if([SELECT IsSandbox FROM Organization LIMIT 1].IsSandbox){
+            endpintUrl = configdata.Dialer_Sand_bulk_lead_push_endp__c;
+            username=configdata.Dialer_Sandb_Verve_Username__c;
+            password=configdata.Dialer_Sandb_Verve_Pass__c;
+
+        }else//prod
+        {
+            endpintUrl = configdata.Dialer_Prod_bulk_lead_push_endp__c;
+            username=configdata.Dialer_User_Name_Prod__c;
+            password=configdata.Dialer_Password_Prod__c;
+
+        }
+
+        recordtype upes =[select id from recordtype where sobjecttype='lead' and developername='upes'];
+        Time timeStart = Time.newInstance(9, 0, 0, 0); // 9 am
+        Time timeEnd = Time.newInstance(20, 0, 0, 0); // 8 pm
+        DateTime dtStart = DateTime.newInstance(Date.today(), timeStart);
+        DateTime dtEnd = DateTime.newInstance(Date.today(), timeEnd);
+        LIST<Id> leadsTmp = new LIST<Id>();
+
+        for (Lead l : [Select id,First_Source__c,LeadSource from Lead  where id=:leads and applying_year__c = :system.label.Academic_Year and Course_Code__c not in ('151003') ]){
+            // Fetch the SourceMaster record for the First_Source__c value
+            List<Sub_Sources__c> sourceMasterRecordList = [SELECT Data_Source__c FROM Sub_Sources__c WHERE Name = :l.First_Source__c or Name = :l.LeadSource LIMIT 1];
+            Sub_Sources__c sourceMasterRecord = new Sub_Sources__c();
+            boolean sourceExist = false;
+            system.debug('sourceMasterRecordList..'+sourceMasterRecordList);
+            if (!sourceMasterRecordList.isEmpty()) {
+                sourceExist = true;
+                sourceMasterRecord = sourceMasterRecordList[0];
+            }
+
+            // Check if the data source is not 'Partner Portals'
+            if ((sourceExist && sourceMasterRecord.Data_Source__c != 'Partner Portals') || !sourceExist) {
+                system.debug('Non-Partner');
+
+                leadsTmp.add(l.Id);
+            }
+        }
+        leads = new LIST<Id>();
+        leads.addAll(leadsTmp);
+        //End
+
+        Log__c activityLogs=new Log__c();
+        activityLogs.Name = 'Push-Lead1';
+        aggregateresult [] othersources = [Select count(id) cnt,Lead__c  from Duplicate_Lead_Sources__c  Where Lead__c   in:leads  group by Lead__c]  ;
+        //  String othersoucrcesname = [Select Name    from Duplicate_Lead_Sources__c where Lead__c    in:leads  ];
+        //  system.debug('uuu'+othersources.size());
+        set<string> emailset =new set<string>();
+        set<string> mobileset =new set<string>();
+        LIST<LeadPushDataToCTI> dataList=new LIST<LeadPushDataToCTI>();
+        //  list<lead> ldlist1 =[Select id,mobilephone,email,CreatedDate,Course_School__c from lead where (email =:emailset or mobilephone =:mobileset) AND RecordType.DeveloperName='upes'];
+        Lead_Push_Count__c directWebsite = Lead_Push_Count__c.getValues('Direct-Website');
+        Boolean p10 = false,updatecount = false;
+        list<id> ldidlist   = new list<id>();
+        for(aggregateresult ag:othersources){
+            id ldid ;
+            system.debug('ldid'+ldid);
+            if(integer.valueOf(ag.get('cnt'))>1){
+                ldid = string.valueof(ag.get('Lead__c'));
+            }
+            ldidlist.add(ldid);
+
+        }
+        Integer callattemt=0;
+        list<lead> ldlist =[select Student_consent__c, id,CSID__c, Select_Courses__c,PhD_Course__c, (select Created_date_and_time__c,Lead_Source_Name__c,Name,Source_Master__r.Name,Data_Source__c,CreatedDate,Status__c from Duplicate_Lead_Sources__r  order by CreatedDate desc limit 1),Data_Source1__c,Lead_Source_1__c,Course_School__c,MobilePhone,Status,LeadSource,data_source__c,CreatedDate,Lead_Source2__r.Name from lead where data_source__c NOT IN ('SCP/CCP','BD','Callcentre-Inbound Calls') AND First_Data_Source__c  NOT IN ('SCP/CCP','BD','Callcentre-Inbound Calls','School Contact Program') AND
+                            LeadSource NOT IN ('School Contact Program','Whatsapp','CallCenter- Chat') And
+                            status NOT IN ('PAID')  AND Lead_Source__r.Data_Source__c NOT IN ('SCP/CCP','BD','Callcentre-Inbound Calls') AND
+                            applying_year__c= :system.label.Academic_Year AND id =:ldidlist and RecordType.DeveloperName='upes'AND Total_Call_Attempts__c =:callattemt];
+
+
+        //   Boolean PhdCourse1;
+        for(lead ld:ldlist){
+            //   PhdCourse1 = ld.PhD_Course__c;
+            //   System.debug(' Is Phd Course ? = '+PhdCourse1);
+
+            //  if(PhdCourse1 == false)             //Added by Aman, Value to this field is updatd via flow
+            DateTime dt =ld.createddate;
+            String sfdate = dt.format('yyyy-MM-dd HH:mm:ss');
+            //     system.debug('sfdate=='+sfdate);
+            String todayDay = dt.format('EEEE');
+            system.debug('ytdgdghhg');
+            activityLogs.API_Request__c='leadId=='+ld.id+'\n';
+            //added by deepanshu
+            for(Duplicate_Lead_Sources__c dl:ld.Duplicate_Lead_Sources__r){
+
+
+                // DateTime dtos=dl.CreatedDate;
+                // String created_date_time = dtos.format('yyyy-MM-dd HH:mm:ss');
+                //   system.debug('created date'+created_date_time);
+                activityLogs.API_Request__c=activityLogs.API_Request__c+'\n'+'Response:::::::{'+'campName:'+ld.Course_School__c+';'+'phone1:'+ld.MobilePhone+','+'listName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c+','+
+                    'skillName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 10').Skill__c+','+'sfdate:'+sfdate+'status:'+dl.Status__c+'lead source:'+dl.Lead_Source_Name__c+'data_source:'+dl.Data_Source__c+'other source CreatedDate:'+dl.Created_date_and_time__c+'other source name:'+dl.Name+'}';
+
+
+
+                dataList.add(new LeadPushDataToCTI((ld.Course_School__c!=null && ld.Course_School__c!='')?ld.Course_School__c:System.Label.Contaque_Lead_Push_Unknown_School_Campaign, ld.mobilephone.right(10),
+                                                   Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c,Lead_Push_Priority_Levels__c.getInstance('Priority 10').Skill__c,sfdate,dl.Name,dl.Data_Source__c, dl.Created_date_and_time__c,dl.Status__c,dl.Lead_Source_Name__c));
+
+                system.debug('data list first:'+dataList);
+            }
+            ld.Posted_date__C=Date.Today();
+            activityLogs.Activityid__c=Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c;
+            ld.CTI_Priority__c='p10';
+
+
+            Http h=new Http();
+            HttpRequest req=new HttpRequest();
+            //req.setEndpoint(System.Label.Contaque_Lead_Push);
+            req.setEndpoint(endpintUrl);
+            req.setMethod('POST');
+            req.setHeader('Content-Type', 'application/json');
+            req.setTimeout(120000);
+            req.setBody(JSON.serialize(dataList));
+            system.debug(JSON.serialize(dataList));
+            // Set up Basic Authorization header new
+            Blob headerValue = Blob.valueOf(username + ':' + password);
+            String authorizationHeader = 'Basic ' + EncodingUtil.base64Encode(headerValue);
+            req.setHeader('Authorization', authorizationHeader);
+
+            try
+            {
+                httpresponse res= h.send(req);
+                if(res.getStatusCode()==200)
+                {
+                    activityLogs.API_Response__c=res.getBody();
+                    insert activityLogs;
+                    update ldlist;
+
+                    if(updatecount)
+                        update directWebsite;
+                }
+            }
+            catch(Exception e)
+            {
+                activityLogs.API_Response__c=e.getMessage();
+                insert activityLogs;
+
+            }
+
+
+
+        }
+
+    }
+
+    global static void pushLeadsProcess(LIST<Id> leads){
+
+        //get configuration data
+        All_Configuration_details__c configdata = All_Configuration_details__c.getOrgDefaults();
+        String AcademicYear = configdata.Current_Appliyng_Year__c;
+
+        system.debug(leads);
+        recordtype upes =[select id from recordtype where sobjecttype='lead' and developername='upes'];
+
+
+        Time timeStart = Time.newInstance(9, 0, 0, 0); // 9 am
+        Time timeEnd = Time.newInstance(20, 0, 0, 0); // 8 pm
+        DateTime dtStart = DateTime.newInstance(Date.today(), timeStart);
+        DateTime dtEnd = DateTime.newInstance(Date.today(), timeEnd);
+
+        //Date sunday = Date.newInstance(1900, 1, 7);
+        Log__c activityLogs=new Log__c();
+        activityLogs.Name='Lead-Push0';
+
+
+
+        LIST<LeadPushDataToCTI> dataList=new LIST<LeadPushDataToCTI>();
+        Integer callattemt=0;
+        List<Lead> LeadPush = new List<Lead>();
+        LIST<Id> leadsTmp = new LIST<Id>();
+
+        //Start: exclude for partner portal user. 12 July 2023
+        for (Lead l : [Select id, Student_consent__c,CSID__c, Select_Courses__c,PhD_Course__c, (select Created_date_and_time__c,Lead_Source_Name__c, Name,Source_Master__r.Name,Data_Source__c,CreatedDate,Status__c from Duplicate_Lead_Sources__r Where Data_Source__c NOT IN ('BD','Callcentre-Inbound Calls')  order by CreatedDate desc  limit 1  ),
+                       mobilephone,Course_School__c,CreatedDate,status ,Lead_Source_1__c, data_source__c,Data_Source1__c, First_Source__c,
+                       Salesforce_Created_Date_and_Time__c,Lead_Group__c,Lead_Source2__r.Name,LeadSource,First_Data_Source__c,Lead_Source__r.Data_Source__c
+
+                       from Lead
+                       where
+                       Course_Code__c not in ('151003') AND
+                       data_source__c NOT IN ('SCP/CCP','BD','Callcentre-Inbound Calls') AND First_Data_Source__c  NOT IN ('SCP/CCP','BD','Callcentre-Inbound Calls') AND
+                       LeadSource NOT IN ('School Contact Program','Whatsapp','CallCenter- Chat') AND
+                       status NOT IN ('PAID')  AND Lead_Source__r.Data_Source__c NOT IN ('SCP/CCP','BD','Callcentre-Inbound Calls') AND
+                       applying_year__c= :system.label.Academic_Year AND RecordType.DeveloperName='upes' AND id=:leads AND Total_Call_Attempts__c =:callattemt]){
+
+                           // Fetch the SourceMaster record for the First_Source__c value
+                           List<Sub_Sources__c> sourceMasterRecordList = [SELECT Data_Source__c FROM Sub_Sources__c WHERE Name = :l.First_Source__c or Name = :l.LeadSource LIMIT 1];
+                           Sub_Sources__c sourceMasterRecord = new Sub_Sources__c();
+                           boolean sourceExist = false;
+                           system.debug('sourceMasterRecordList..'+sourceMasterRecordList);
+                           if (!sourceMasterRecordList.isEmpty()) {
+                               sourceExist = true;
+                               sourceMasterRecord = sourceMasterRecordList[0];
+                           }
+
+                           // Check if the data source is not 'Partner Portals'
+                           if ((sourceExist && sourceMasterRecord.Data_Source__c != 'Partner Portals') || !sourceExist) {
+                               system.debug('Non-Partner');
+
+                               leadsTmp.add(l.Id);
+                               LeadPush.add(l);
+                           }
+
+                       }// end of for loop on
+        leads = new LIST<Id>();
+        leads.addAll(leadsTmp);
+        //End
+
+
+
+        aggregateresult [] othersources = [Select count(id) cnt,Lead__c  from Duplicate_Lead_Sources__c   Where Data_Source__c NOT IN ('SCP/CCP','BD','Callcentre-Inbound Calls') AND Lead__c    in:leads and Lead__r.RecordType.DeveloperName='upes' group by Lead__c]  ;
+
+        //  system.debug('uuu'+othersources.size());
+        set<string> emailset =new set<string>();
+        set<string> mobileset =new set<string>();
+
+        //  list<lead> ldlist1 =[Select id,mobilephone,email,CreatedDate,Course_School__c from lead where (email =:emailset or mobilephone =:mobileset) AND RecordType.DeveloperName='upes'];
+        Lead_Push_Count__c directWebsite = Lead_Push_Count__c.getValues('Direct-Website');
+        Boolean p10 = false,updatecount = false;
+        //list<id> ldidlist   = new list<id>();
+
+        //list<lead> ldlist =[select id  from lead where id =:ldidlist];
+        system.debug(' checking lead push ' + LeadPush);
+        //  Boolean PhdCourse2;
+        if(LeadPush.size()>0){
+            for(Lead ld:LeadPush){
+
+                //  PhdCourse2 = ld.PhD_Course__c;
+                //  System.debug(' Is Phd Course ? = '+PhdCourse2);
+                //   if(PhdCourse2 == False)                       //Added by Aman, Value to this field is updatd via flow
+
+                DateTime dt =ld.createddate;
+
+                String sfdate = dt.format('yyyy-MM-dd HH:mm:ss');
+
+                //     system.debug('sfdate=='+sfdate);
+                String todayDay = dt.format('EEEE');
+                // system.debug('todayDay=='+todayDay);
+                for(Duplicate_Lead_Sources__c dl:ld.Duplicate_Lead_Sources__r){
+
+                    //  DateTime dtos=dl.CreatedDate;
+                    // String created_date_time = dtos.format('yyyy-MM-dd HH:mm:ss');
+                    // system.debug('created date'+created_date_time);
+
+                    if(ld.CreatedDate >= dtStart && ld.CreatedDate < dtEnd  && ld.Data_Source1__c=='Direct-Website' && dl.Data_Source__c!='SCP/CCP'){
+                        if(directWebsite.date__c<date.today()) {
+                            directWebsite.date__c=date.today();
+                            directWebsite.count__c=1;
+                            activityLogs.API_Request__c='leadId=='+ld.id+'\n';
+                            system.debug('start');
+                            activityLogs.SF_Lead_ID__c = ld.id;
+                            activityLogs.API_Request__c=activityLogs.API_Request__c+'\n'+'Response:::::::{'+'campName:'+ld.Course_School__c+';'+'phone1:'+ld.MobilePhone+','+'listName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c+','+
+                                'skillName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 10').Skill__c+','+'sfdate:'+sfdate+'status:'+dl.Status__c+'lead source:'+dl.Lead_Source_Name__c+'data_source:'+dl.Data_Source__c+'CreatedDate:'+dl.Created_date_and_time__c+'other source name:'+dl.Name+'}';
+                            system.debug('end');
+
+                            dataList.add(new LeadPushDataToCTI((ld.Course_School__c!=null &&
+                                                                ld.Course_School__c!='')?ld.Course_School__c:System.Label.Contaque_Lead_Push_Unknown_School_Campaign, ld.mobilephone.right(10),Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c,Lead_Push_Priority_Levels__c.getInstance('Priority 10').Skill__c,sfdate,dl.Name,dl.Data_Source__c, dl.Created_date_and_time__c,dl.Status__c,dl.Source_Master__r.Name));
+                            system.debug(' dataList'+ dataList);
+                            ld.Posted_date__C=Date.Today();
+                            activityLogs.Activityid__c=Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c;
+                            ld.CTI_Priority__c='p10';
+                        }
+                        else if(directWebsite.date__c==date.today() && directWebsite.count__c<1000){
+                            directWebsite.count__c=directWebsite.count__c+1;
+                            activityLogs.API_Request__c='leadId=='+ld.id+'\n';
+                            activityLogs.SF_Lead_ID__c = ld.id;
+                            activityLogs.API_Request__c=activityLogs.API_Request__c+'\n'+'Response:::::::{'+'campName:'+ld.Course_School__c+';'+'phone1:'+ld.MobilePhone+','+'listName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c+','+
+                                'skillName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 10').Skill__c+','+'sfdate:'+sfdate+'status:'
+                                +dl.Status__c+'lead source:'+dl.Lead_Source_Name__c+'data_source:'+dl.Data_Source__c+'CreatedDate:'+dl.Created_date_and_time__c+'other source name:'+dl.Name+'}';
+
+
+                            dataList.add(new LeadPushDataToCTI((ld.Course_School__c!=null &&
+                                                                ld.Course_School__c!='')?ld.Course_School__c:System.Label.Contaque_Lead_Push_Unknown_School_Campaign, ld.mobilephone.right(10),Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c,Lead_Push_Priority_Levels__c.getInstance('Priority 10').Skill__c,sfdate,dl.Name,dl.Data_Source__c, dl.Created_date_and_time__c,dl.Status__c,dl.Source_Master__r.Name));
+                            system.debug('camp name:'+System.Label.Contaque_Lead_Push_Unknown_School_Campaign);
+                            system.debug(' dataList'+ dataList);
+                            ld.Posted_date__C=Date.Today();
+                            activityLogs.Activityid__c=Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c;
+                            ld.CTI_Priority__c='p10';
+                        } else {
+                            activityLogs.API_Request__c='leadId=='+ld.id+'\n';
+                            activityLogs.SF_Lead_ID__c = ld.id;
+                            activityLogs.API_Request__c=activityLogs.API_Request__c+'\n'+'Response:::::::{'+'campName:'+ld.Course_School__c+';'+'phone1:'+ld.MobilePhone+','+'listName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 9').Priority_Level__c+','+
+                                'skillName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 9').Skill__c+','+'sfdate:'+sfdate+'status:'+ld.Status+'lead source:'+ld.Lead_Source_1__c+'data_source:'+ld.Data_Source1__c+'CreatedDate:'+ld.CreatedDate+'other source name:'+dl.Name+'}';
+
+
+                            dataList.add(new LeadPushDataToCTI((ld.Course_School__c!=null && ld.Course_School__c!='')?ld.Course_School__c:System.Label.Contaque_Lead_Push_Unknown_School_Campaign, ld.mobilephone.right(10),Lead_Push_Priority_Levels__c.getInstance('Priority 9').Priority_Level__c,Lead_Push_Priority_Levels__c.getInstance('Priority 9').Skill__c,sfdate,dl.Name,dl.Data_Source__c, dl.Created_date_and_time__c,dl.Status__c,dl.Lead_Source_Name__c));
+                            system.debug('camp name'+System.Label.Contaque_Lead_Push_Unknown_School_Campaign);
+                            system.debug(' dataList'+ dataList);
+                            ld.Posted_date__C=Date.Today();
+                            activityLogs.Activityid__c=Lead_Push_Priority_Levels__c.getInstance('Priority 9').Priority_Level__c;
+                            ld.CTI_Priority__c='p9';
+                        }
+                        system.debug('CTI_Priority__c=='+ ld.CTI_Priority__c);
+                        updatecount=true;
+                    }
+
+                    else if((ld.LeadSource == 'Call Back') || (ld.Data_Source1__c == 'Online Leads' && ld.Lead_Group__c == 'Organic')){
+                        activityLogs.API_Request__c='leadId=='+ld.id+'\n';
+                        activityLogs.SF_Lead_ID__c = ld.id;
+                        activityLogs.API_Request__c=activityLogs.API_Request__c+'\n'+'Response:::::::{'+'campName:'+ld.Course_School__c+';'+'phone1:'+ld.MobilePhone+','+'listName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c+','+
+                            'skillName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 10').Skill__c+','+'sfdate:'+sfdate+'status:'+dl.Status__c+'lead source:'+dl.Lead_Source_Name__c+'data_source:'+dl.Data_Source__c+'CreatedDate:'+dl.Created_date_and_time__c+'other source name:'+dl.Name+'}';
+
+
+                        dataList.add(new LeadPushDataToCTI((ld.Course_School__c!=null && ld.Course_School__c!='')?ld.Course_School__c:System.Label.Contaque_Lead_Push_Unknown_School_Campaign, ld.mobilephone.right(10),Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c,Lead_Push_Priority_Levels__c.getInstance('Priority 10').Skill__c,sfdate,dl.Name,dl.Data_Source__c, dl.Created_date_and_time__c,dl.Status__c,dl.Lead_Source_Name__c));
+                        system.debug(' dataList'+ dataList);
+                        ld.Posted_date__C=Date.Today();
+                        activityLogs.Activityid__c=Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c;
+                        ld.CTI_Priority__c='p10';
+                    }
+
+
+                    else if(ld.CreatedDate >= dtStart && ld.CreatedDate < dtEnd  && ld.Data_Source1__c=='Direct-Website' && p10){
+                        activityLogs.API_Request__c='leadId=='+ld.id+'\n';
+                        activityLogs.SF_Lead_ID__c = ld.id;
+                        activityLogs.API_Request__c=activityLogs.API_Request__c+'\n'+'Response:::::::{'+'campName:'+ld.Course_School__c+';'+'phone1:'+ld.MobilePhone+','+'listName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c+','+
+                            'skillName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 10').Skill__c+','+'sfdate:'+sfdate+'status:'+dl.Status__c+'lead source:'+dl.Lead_Source_Name__c+'data_source:'+dl.Data_Source__c+'CreatedDate:'+dl.CreatedDate+'other source name:'+dl.Name+'}';
+
+
+                        dataList.add(new LeadPushDataToCTI((ld.Course_School__c!=null && ld.Course_School__c!='')?ld.Course_School__c:System.Label.Contaque_Lead_Push_Unknown_School_Campaign, ld.mobilephone.right(10),Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c,Lead_Push_Priority_Levels__c.getInstance('Priority 10').Skill__c,sfdate,dl.Name,dl.Data_Source__c,dl.Created_date_and_time__c,dl.Status__c,dl.Lead_Source_Name__c));
+                        system.debug(' dataList'+ dataList);
+                        ld.Posted_date__C=Date.Today();
+                        activityLogs.Activityid__c=Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c;
+                        ld.CTI_Priority__c='p10';
+                    }
+
+                    else  if ((ld.CreatedDate >= dtStart) && (ld.CreatedDate < dtEnd) && (todayDay !='Sunday') ){
+                        system.debug(ld.Data_Source1__c);
+                        activityLogs.API_Request__c='leadId=='+ld.id+'\n';
+                        activityLogs.SF_Lead_ID__c = ld.id;
+                        activityLogs.API_Request__c=activityLogs.API_Request__c+'\n'+'Response:::::::{'+'campName:'+ld.Course_School__c+';'+'phone1:'+ld.MobilePhone+','+'listName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 9').Priority_Level__c+','+
+                            'skillName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 9').Skill__c+','+'sfdate:'+sfdate+'status:'+ld.Status+'lead source:'+ld.Lead_Source_1__c+'data_source:'+ld.Data_Source1__c+'CreatedDate:'+dl.Created_date_and_time__c+'other source name:'+dl.Name+'}';
+
+
+                        dataList.add(new LeadPushDataToCTI((ld.Course_School__c!=null && ld.Course_School__c!='')?ld.Course_School__c:System.Label.Contaque_Lead_Push_Unknown_School_Campaign, ld.mobilephone.right(10),Lead_Push_Priority_Levels__c.getInstance('Priority 9').Priority_Level__c,Lead_Push_Priority_Levels__c.getInstance('Priority 9').Skill__c,sfdate,dl.Name,dl.Data_Source__c, dl.Created_date_and_time__c,dl.Status__c,dl.Lead_Source_Name__c));
+                        system.debug(' dataList'+ dataList);
+                        ld.Posted_date__C=Date.Today();
+                        activityLogs.Activityid__c=Lead_Push_Priority_Levels__c.getInstance('Priority 9').Priority_Level__c;
+                        ld.CTI_Priority__c='p9';
+                    }
+
+                    else  {
+                        activityLogs.API_Request__c='leadId=='+ld.id+'\n';
+                        activityLogs.SF_Lead_ID__c = ld.id;
+                        activityLogs.API_Request__c=activityLogs.API_Request__c+'Response:::::::{'+'campName:'+ld.Course_School__c+';'+'phone1:'+ld.MobilePhone+','+'listName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 8').Priority_Level__c+','+
+                            'skillName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 8').Skill__c+','+'sfdate:'+sfdate+'status:'+ld.Status+'lead source:'+ld.Lead_Source_1__c+'data_source:'+ld.Data_Source1__c+'CreatedDate:'+ld.CreatedDate+'other source name:'+dl.Name+'}';
+                        dataList.add(new LeadPushDataToCTI((ld.Course_School__c!=null && ld.Course_School__c!='')?ld.Course_School__c:System.Label.Contaque_Lead_Push_Unknown_School_Campaign, ld.mobilephone.right(10),Lead_Push_Priority_Levels__c.getInstance('Priority 8').Priority_Level__c,Lead_Push_Priority_Levels__c.getInstance('Priority 8').Skill__c,sfdate,dl.Name,dl.Data_Source__c, dl.Created_date_and_time__c,dl.Status__c,dl.Lead_Source_Name__c));
+                        system.debug(' dataList'+ dataList);
+                        ld.Posted_date__C=Date.Today();
+                        activityLogs.Activityid__c=Lead_Push_Priority_Levels__c.getInstance('Priority 8').Priority_Level__c;
+                        ld.CTI_Priority__c='p8';
+                    }
+                }
+
+
+            } // end of for leadpush
+
+            String endpintUrl;
+            String username;
+            String password;
+            //added under verve
+            if([SELECT IsSandbox FROM Organization LIMIT 1].IsSandbox){
+                endpintUrl = configdata.Dialer_Sand_bulk_lead_push_endp__c;
+                username=configdata.Dialer_Sandb_Verve_Username__c;
+                password=configdata.Dialer_Sandb_Verve_Pass__c;
+
+            }else//prod
+            {
+                endpintUrl = configdata.Dialer_Prod_bulk_lead_push_endp__c;
+                username=configdata.Dialer_User_Name_Prod__c;
+                password=configdata.Dialer_Password_Prod__c;
+
+            }
+            Http h=new Http();
+            HttpRequest req=new HttpRequest();
+            //req.setEndpoint(System.Label.Contaque_Lead_Push);
+            req.setEndpoint(endpintUrl);
+            req.setMethod('POST');
+            req.setHeader('Content-Type', 'application/json');
+            req.setBody(JSON.serialize(dataList));
+
+            // Set up Basic Authorization header new
+            Blob headerValue = Blob.valueOf(username + ':' + password);
+            String authorizationHeader = 'Basic ' + EncodingUtil.base64Encode(headerValue);
+            req.setHeader('Authorization', authorizationHeader);
+
+
+            activityLogs.Json_Request__c = JSON.serialize(dataList);
+            activityLogs.API_Response__c = '@Endp : ' + endpintUrl;
+            req.setTimeout(120000);
+            system.debug('lead push req ' +JSON.serialize(dataList) );
+            if(configdata.Run_store_ip_address__c){
+                activityLogs =  AdditionalFuncUtility.getPublicIpAddress(activityLogs);
+            }
+
+            try
+            {
+
+
+                httpresponse res= h.send(req);
+                if(res.getStatusCode()==200)
+                {
+                    activityLogs.API_Response__c=String.isBlank(activityLogs.API_Response__c)? res.getBody() : activityLogs.API_Response__c + ' Dialer '  +res.getBody() ;
+
+                    insert activityLogs;
+                    update leadPush;
+                    system.debug(leadPush);
+
+                    if(updatecount)
+                        update directWebsite;
+
+                }else{//Response is not 200
+                    activityLogs.API_Response__c= String.isBlank(activityLogs.API_Response__c)? res.getStatusCode() + ' @ ' + res.getBody() : activityLogs.API_Response__c + ' Dialer '  +res.getStatusCode() + ' @ ' + res.getBody() ;
+                    //activityLogs.API_Response__c= res.getStatusCode() + ' @ ' + res.getBody();
+                    activityLogs.Status__c = 'Initial Lead Push error';
+                    //send mail
+                    if(configdata.Send_Dialer_error_mail__c){
+                        activityLogs = NotificationAlertError.sendEmailNotification(activityLogs , 'Response is not 200 ', res.getStatusCode() + ' @ ' + res.getBody() );
+                    }
+                    insert activityLogs;
+                }
+            }
+            catch(Exception e)
+            {
+
+                //activityLogs.API_Response__c=e.getMessage();
+                activityLogs.API_Response__c= String.isBlank(activityLogs.API_Response__c)? e.getMessage() : activityLogs.API_Response__c + ' Dialer '  +e.getMessage() ;
+                activityLogs.Status__c = 'Initial Lead Push error';
+                //send mail
+                if(configdata.Send_Dialer_error_mail__c){
+                    activityLogs = NotificationAlertError.sendEmailNotification(activityLogs ,  'Exception occured in Dialer integration UPES ',  e.getMessage() );
+                }
+                insert activityLogs;
+
+
+            }
+
+        }//end of if leadpushsize
+
+    }//process lead method end
+
+
+
+    //Re- enquire leads
+    //get called from duplicateleadpush trigger
+    @future(callout=true)
+    global static void pushrenqLeadsFuture(LIST<Id> leads,String Source, String SubSource){
+        LeadPushContaque.reEnquirePush(leads , Source,  SubSource);
+    }
+
+
+    global static void reEnquirePush(List<Id> reEnqLeadIds,String Source, String SubSource){
+
+        //get configuration data
+        All_Configuration_details__c configdata = All_Configuration_details__c.getOrgDefaults();
+        String AcademicYear = configdata.Current_Appliyng_Year__c;
+        Time timeStart = Time.newInstance(9, 0, 0, 0); // 9 am
+        Time timeEnd = Time.newInstance(20, 0, 0, 0); // 8 pm
+        DateTime dtStart = DateTime.newInstance(Date.today(), timeStart);
+        DateTime dtEnd = DateTime.newInstance(Date.today(), timeEnd);
+        System.debug('Inside reEnquirePush ' + reEnqLeadIds + 'start ' + dtStart + 'end ' + dtEnd);
+
+        if(configdata.Run_Reenquire__c){
+
+            List<lead> reEnquireLeads = [Select id, Student_consent__c,CSID__c, Select_Courses__c,PhD_Course__c, Re_Enquire_Count__c,
+                                         (  select Created_date_and_time__c,Lead_Source_Name__c, Name,Source_Master__r.Name,Data_Source__c,CreatedDate,Status__c
+                                          from Duplicate_Lead_Sources__r
+                                          Where Data_Source__c NOT IN ('BD','Callcentre-Inbound Calls') AND Status__c NOT IN ('PAID')  order by CreatedDate desc  limit 1
+                                         ),
+                                         mobilephone,Course_School__c,CreatedDate,status ,Lead_Source_1__c, data_source__c,Data_Source1__c, First_Source__c,
+                                         Salesforce_Created_Date_and_Time__c,Lead_Group__c,Lead_Source2__r.Name,LeadSource,First_Data_Source__c,Lead_Source__r.Data_Source__c
+
+                                         from Lead
+
+                                         Where id IN : reEnqLeadIds  AND
+                                         Course_Code__c not in ('151003') AND
+
+                                         PhD_Course__c = false AND
+                                         //Update_Reenquire__c = 'Re-Enquire' AND
+                                         data_source__c NOT IN ('SCP/CCP','BD','Callcentre-Inbound Calls')
+                                         AND First_Data_Source__c  NOT IN ('SCP/CCP','BD','Callcentre-Inbound Calls') AND
+                                         LeadSource NOT IN ('School Contact Program','Whatsapp','CallCenter- Chat') AND
+                                         status NOT IN ('PAID')  AND
+                                         (applying_year__c= :system.label.Academic_Year OR applying_year__c=: '2024') AND
+                                         RecordType.DeveloperName='upes'
+
+                                        ];
+
+
+            List<LeadPushDataToCTI>   dataList =  new list<LeadPushDataToCTI>();
+            Log__c activityLogs=new Log__c();
+            activityLogs.Name='Lead-Push-reenq';
+            List<Lead> LeadPush = new List<Lead>();
+            for(lead lrec : reEnquireLeads){
+
+
+
+
+                List<Sub_Sources__c> sourceMasterRecordList = [SELECT Data_Source__c FROM Sub_Sources__c WHERE Name = :lrec.First_Source__c or Name = :lrec.LeadSource LIMIT 1];
+                Sub_Sources__c sourceMasterRecord = new Sub_Sources__c();
+                boolean sourceExist = false;
+                system.debug('sourceMasterRecordList..'+sourceMasterRecordList);
+                if (!sourceMasterRecordList.isEmpty()) {
+                    sourceExist = true;
+                    sourceMasterRecord = sourceMasterRecordList[0];
+                }
+
+                // Check if the data source is not 'Partner Portals'
+                if ((sourceExist && sourceMasterRecord.Data_Source__c != 'Partner Portals') || !sourceExist) {
+                    system.debug('Non-Partner');
+                    LeadPush.add(lrec);
+                }//end of if
+
+
+
+            } //end of for
+
+
+            if(LeadPush.size() > 0){
+
+                for(lead ld : LeadPush){
+                    DateTime dt =ld.createddate;
+
+                    String sfdate = dt.format('yyyy-MM-dd HH:mm:ss');
+                    String todayDay = dt.format('EEEE');
+                    boolean p10=false;
+                    //condition for speak 2 counsller form
+                    if(source ==configdata.Speak2CounslerSource__c  && subsource == configdata.Speak2CounslerSubSource__c ){
+                        p10 = true;
+                    }
+
+
+                    for(Duplicate_Lead_Sources__c dl:ld.Duplicate_Lead_Sources__r){
+                        activityLogs.API_Request__c='leadId=='+ld.id+'\n';
+
+                        if(p10){
+                            activityLogs.API_Request__c=activityLogs.API_Request__c+'\n'+'Response:::::::{'+'campName:'+ld.Course_School__c+';'+'phone1:'+ld.MobilePhone+','+'listName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c+','+
+                                'skillName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 10').Skill__c+','+'sfdate:'+sfdate+'status:'+ld.Status+'lead source:'+ld.Lead_Source_1__c+'data_source:'+ld.Data_Source1__c+'CreatedDate:'+ld.CreatedDate+'other source name:'+dl.Name+'}';
+
+
+                            dataList.add(new LeadPushDataToCTI((ld.Course_School__c!=null && ld.Course_School__c!='')?ld.Course_School__c:System.Label.Contaque_Lead_Push_Unknown_School_Campaign, ld.mobilephone.right(10),Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c,Lead_Push_Priority_Levels__c.getInstance('Priority 10').Skill__c,sfdate,dl.Name,dl.Data_Source__c, dl.Created_date_and_time__c,dl.Status__c,dl.Lead_Source_Name__c));
+
+                            ld.Posted_date__C=Date.Today();
+                            activityLogs.Activityid__c=Lead_Push_Priority_Levels__c.getInstance('Priority 10').Priority_Level__c;
+                            ld.CTI_Priority__c='p10';
+                        }
+                        else if( (ld.CreatedDate >= dtStart) && (ld.CreatedDate < dtEnd) && (todayDay !='Sunday') ){
+                            activityLogs.API_Request__c='leadId=='+ld.id+'\n';
+                            activityLogs.API_Request__c=activityLogs.API_Request__c+'\n'+'Response:::::::{'+'campName:'+ld.Course_School__c+';'+'phone1:'+ld.MobilePhone+','+'listName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 9').Priority_Level__c+','+
+                                'skillName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 9').Skill__c+','+'sfdate:'+sfdate+'status:'+ld.Status+'lead source:'+ld.Lead_Source_1__c+'data_source:'+ld.Data_Source1__c+'CreatedDate:'+dl.Created_date_and_time__c+'other source name:'+dl.Name+'}';
+                            dataList.add(new LeadPushDataToCTI((ld.Course_School__c!=null && ld.Course_School__c!='')?ld.Course_School__c:System.Label.Contaque_Lead_Push_Unknown_School_Campaign, ld.mobilephone.right(10),Lead_Push_Priority_Levels__c.getInstance('Priority 9').Priority_Level__c,Lead_Push_Priority_Levels__c.getInstance('Priority 9').Skill__c,sfdate,dl.Name,dl.Data_Source__c, dl.Created_date_and_time__c,dl.Status__c,dl.Lead_Source_Name__c));
+                            system.debug(' dataList'+ dataList);
+                            ld.Posted_date__C=Date.Today();
+                            activityLogs.Activityid__c=Lead_Push_Priority_Levels__c.getInstance('Priority 9').Priority_Level__c;
+                            ld.CTI_Priority__c='p9';
+
+                        }else
+                        {
+                            activityLogs.API_Request__c='leadId=='+ld.id+'\n';
+                            activityLogs.API_Request__c=activityLogs.API_Request__c+'Response:::::::{'+'campName:'+ld.Course_School__c+';'+'phone1:'+ld.MobilePhone+','+'listName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 8').Priority_Level__c+','+
+                                'skillName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 8').Skill__c+','+'sfdate:'+sfdate+'status:'+ld.Status+'lead source:'+ld.Lead_Source_1__c+'data_source:'+ld.Data_Source1__c+'CreatedDate:'+ld.CreatedDate+'other source name:'+dl.Name+'}';
+                            dataList.add(new LeadPushDataToCTI((ld.Course_School__c!=null && ld.Course_School__c!='')?ld.Course_School__c:System.Label.Contaque_Lead_Push_Unknown_School_Campaign, ld.mobilephone.right(10),Lead_Push_Priority_Levels__c.getInstance('Priority 8').Priority_Level__c,Lead_Push_Priority_Levels__c.getInstance('Priority 8').Skill__c,sfdate,dl.Name,dl.Data_Source__c, dl.Created_date_and_time__c,dl.Status__c,dl.Lead_Source_Name__c));
+                            activityLogs.Activityid__c=Lead_Push_Priority_Levels__c.getInstance('Priority 8').Priority_Level__c;
+                            ld.CTI_Priority__c='p8';
+                            ld.Posted_date__C=Date.Today();
+                        }
+
+                        ld.Re_Enquire_Count__c = ld.Re_Enquire_Count__c==null  ? 1 : ld.Re_Enquire_Count__c  + 1;
+                        ld.Re_Enquire_Date__c = System.Now();
+
+                    } //other source loop end
+
+
+                }//for loopp end
+            }//if leadpush size
+
+            String endpintUrl;
+            String username;
+            String password;
+            //added under verve
+            if([SELECT IsSandbox FROM Organization LIMIT 1].IsSandbox){
+                endpintUrl = configdata.Dialer_Sand_bulk_lead_push_endp__c;
+                username=configdata.Dialer_Sandb_Verve_Username__c;
+                password=configdata.Dialer_Sandb_Verve_Pass__c;
+
+            }else//prod
+            {
+                endpintUrl = configdata.Dialer_Prod_bulk_lead_push_endp__c;
+                username=configdata.Dialer_User_Name_Prod__c;
+                password=configdata.Dialer_Password_Prod__c;
+
+            }
+
+            if(!dataList.isEmpty()){
+
+
+
+
+                Http h=new Http();
+                HttpRequest req=new HttpRequest();
+                req.setTimeout(120000);
+                //req.setEndpoint(System.Label.Contaque_Lead_Push);
+                req.setEndpoint(endpintUrl);
+                req.setMethod('POST');
+                req.setHeader('Content-Type', 'application/json');
+                system.debug('PK checking req reenquire  '+ JSON.serialize(dataList));
+                req.setBody(JSON.serialize(dataList));
+
+                // Set up Basic Authorization header new
+
+                Blob headerValue = Blob.valueOf(username + ':' + password);
+                String authorizationHeader = 'Basic ' + EncodingUtil.base64Encode(headerValue);
+                req.setHeader('Authorization', authorizationHeader);
+
+
+                activityLogs.Json_Request__c = JSON.serialize(dataList);
+
+                try
+                {
+                    httpresponse res= h.send(req);
+                    if(res.getStatusCode()==200)
+                    {
+                        activityLogs.API_Response__c=res.getBody();
+                        insert activityLogs;
+                        update leadPush;
+                        system.debug('try reenq '+ leadPush);
+
+                    }else{
+                        activityLogs.API_Response__c=res.getBody();
+                        activityLogs.Status__c = 'Initial Lead Push error';
+                        insert activityLogs;
+                        //Send mail
+                        if(configdata.Send_Dialer_error_mail__c){
+                            activityLogs = NotificationAlertError.sendEmailNotification(activityLogs , 'Response is not 200 ', res.getStatusCode() + ' @ ' + res.getBody() );
+                        }
+                    }
+                }
+                catch(Exception e)
+                {
+                    system.debug('catch reenq + ' + leadPush);
+                    //update leadPush; // for testing
+                    activityLogs.Status__c = 'Initial Lead Push error';
+                    activityLogs.API_Response__c=e.getMessage();
+                    //sned mail
+                    if(configdata.Send_Dialer_error_mail__c){
+                        activityLogs = NotificationAlertError.sendEmailNotification(activityLogs ,  'Exception occured in dialer integration UPES ',  e.getMessage() );
+                    }
+                    insert activityLogs;
+
+
+                }//catch end
+            }//end of dta list size
+        }
+
+    }
+
+    //ANP lead push for update
+    //get called from WebEngage_Leadtrigger trigger after update
+    @future(callout=true)
+    global static void pushAnpLeadsFuture(LIST<Id> leadsIds){
+
+        //get configuration data
+        All_Configuration_details__c configdata = All_Configuration_details__c.getOrgDefaults();
+        String AcademicYear = configdata.Current_Appliyng_Year__c;
+        if(configdata.Run_Anp_Datapush_update__c){ //change this from confi  configdata.ANP_run
+            //get leads based on condition
+            List<lead> anpEnquireLeads  = [Select id, Student_consent__c,CSID__c, Select_Courses__c,PhD_Course__c, Re_Enquire_Count__c,
+                                         (  select Created_date_and_time__c,Lead_Source_Name__c, Name,Source_Master__r.Name,Data_Source__c,CreatedDate,Status__c
+                                          from Duplicate_Lead_Sources__r
+                                          Where Data_Source__c NOT IN ('BD','Callcentre-Inbound Calls') AND Status__c NOT IN ('PAID')  order by CreatedDate desc  limit 1
+                                         ),
+                                         mobilephone,Course_School__c,CreatedDate,status ,Lead_Source_1__c, data_source__c,Data_Source1__c, First_Source__c,
+                                         Salesforce_Created_Date_and_Time__c,Lead_Group__c,Lead_Source2__r.Name,LeadSource,First_Data_Source__c,Lead_Source__r.Data_Source__c
+
+                                         from Lead
+
+                                         Where id IN : leadsIds  AND
+                                         Course_Code__c not in ('151003') AND
+
+                                         PhD_Course__c = false AND
+
+                                         data_source__c NOT IN ('SCP/CCP','BD','Callcentre-Inbound Calls')
+                                         AND First_Data_Source__c  NOT IN ('SCP/CCP','BD','Callcentre-Inbound Calls') AND
+                                         LeadSource NOT IN ('School Contact Program','Whatsapp','CallCenter- Chat') AND
+                                         status NOT IN ('PAID')  AND
+                                         (applying_year__c= :system.label.Academic_Year OR applying_year__c=: '2026') AND
+                                         RecordType.DeveloperName='upes'
+
+                                        ];
+
+            List<LeadPushDataToCTI>   dataList =  new list<LeadPushDataToCTI>();
+            Log__c activityLogs=new Log__c();
+            activityLogs.Name='Lead-Push-ANP';
+            List<Lead> LeadPush = new List<Lead>();
+
+            for(lead lrec : anpEnquireLeads){
+
+                List<Sub_Sources__c> sourceMasterRecordList = [SELECT Data_Source__c FROM Sub_Sources__c WHERE Name = :lrec.First_Source__c or Name = :lrec.LeadSource LIMIT 1];
+                Sub_Sources__c sourceMasterRecord = new Sub_Sources__c();
+                boolean sourceExist = false;
+                system.debug('sourceMasterRecordList..'+sourceMasterRecordList);
+                if (!sourceMasterRecordList.isEmpty()) {
+                    sourceExist = true;
+                    sourceMasterRecord = sourceMasterRecordList[0];
+                }
+
+                // Check if the data source is not 'Partner Portals'
+                if ((sourceExist && sourceMasterRecord.Data_Source__c != 'Partner Portals') || !sourceExist) {
+                    system.debug('Non-Partner');
+                    LeadPush.add(lrec);
+                }// end of if  source
+
+
+            } // for loop end anpEnquireLeads source and LeadPush creation
+
+
+            if(LeadPush.size() > 0){
+
+                for(lead ld : LeadPush){
+                    DateTime dt =ld.createddate;
+                    String sfdate = dt.format('yyyy-MM-dd HH:mm:ss');
+                    for(Duplicate_Lead_Sources__c dl:ld.Duplicate_Lead_Sources__r){
+                        activityLogs.API_Request__c='leadId=='+ld.id+'\n';
+
+                        activityLogs.API_Request__c=activityLogs.API_Request__c+'\n'+'Response:::::::{'+'campName:'+ld.Course_School__c+';'+'phone1:'+ld.MobilePhone+','+'listName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 9').Priority_Level__c+','+
+                                'skillName:'+Lead_Push_Priority_Levels__c.getInstance('Priority 9').Skill__c+','+'sfdate:'+sfdate+'status:'+ld.Status+'lead source:'+ld.Lead_Source_1__c+'data_source:'+ld.Data_Source1__c+'CreatedDate:'+dl.Created_date_and_time__c+'other source name:'+dl.Name+'}';
+
+                        dataList.add(new LeadPushDataToCTI(
+                            (ld.Course_School__c!=null && ld.Course_School__c!='')?ld.Course_School__c:System.Label.Contaque_Lead_Push_Unknown_School_Campaign,
+                            ld.mobilephone.right(10),
+                            Lead_Push_Priority_Levels__c.getInstance('Priority 9').Priority_Level__c,
+                            Lead_Push_Priority_Levels__c.getInstance('Priority 9').Skill__c,
+                            sfdate,
+                            dl.Name,
+                            dl.Data_Source__c,
+                            dl.Created_date_and_time__c,
+                            dl.Status__c,
+                            dl.Lead_Source_Name__c
+                            )
+                        );
+                        system.debug(' dataList'+ dataList);
+                        ld.Posted_date__C=Date.Today();
+                        activityLogs.Activityid__c=Lead_Push_Priority_Levels__c.getInstance('Priority 9').Priority_Level__c;
+                        ld.CTI_Priority__c='p9';
+
+                    }//duplicate source loop
+
+                }// for loop for leadpush
+
+
+
+
+            }// LeadPush if
+
+            String endpintUrl;
+            String username;
+            String password;
+             if([SELECT IsSandbox FROM Organization LIMIT 1].IsSandbox){
+                endpintUrl = configdata.Dialer_Sand_bulk_lead_push_endp__c;
+                username=configdata.Dialer_Sandb_Verve_Username__c;
+                password=configdata.Dialer_Sandb_Verve_Pass__c;
+
+            }else//prod
+            {
+                endpintUrl = configdata.Dialer_Prod_bulk_lead_push_endp__c;
+                username=configdata.Dialer_User_Name_Prod__c;
+                password=configdata.Dialer_Password_Prod__c;
+
+            }
+            if(!dataList.isEmpty()){
+
+
+                Http h=new Http();
+                HttpRequest req=new HttpRequest();
+                req.setTimeout(120000);
+
+                req.setEndpoint(endpintUrl);
+                req.setMethod('POST');
+                req.setHeader('Content-Type', 'application/json');
+                system.debug('PK checking req reenquire  '+ JSON.serialize(dataList));
+                req.setBody(JSON.serialize(dataList));
+
+                // Set up Basic Authorization header new
+
+                Blob headerValue = Blob.valueOf(username + ':' + password);
+                String authorizationHeader = 'Basic ' + EncodingUtil.base64Encode(headerValue);
+                req.setHeader('Authorization', authorizationHeader);
+                activityLogs.Json_Request__c = JSON.serialize(dataList);
+
+                try{
+                    httpresponse res= h.send(req);
+                    if(res.getStatusCode()==200)
+                    {
+                        activityLogs.API_Response__c=res.getBody();
+                        insert activityLogs;
+                        update leadPush;
+                        system.debug('try reenq '+ leadPush);
+
+                    }else{
+                        activityLogs.API_Response__c=res.getBody();
+                        activityLogs.Status__c = 'ANP Lead Push error';
+                        insert activityLogs;
+                        //Send mail
+                        if(configdata.Send_Dialer_error_mail__c){
+                            activityLogs = NotificationAlertError.sendEmailNotification(activityLogs , 'Response is not 200 ', res.getStatusCode() + ' @ ' + res.getBody() );
+                        }
+                    }
+                }catch(Exception e){
+                    system.debug('catch reenq + ' + leadPush);
+                    //update leadPush; // for testing
+                    activityLogs.Status__c = 'ANP Lead Push error';
+                    activityLogs.API_Response__c=e.getMessage();
+                    //sned mail
+                    if(configdata.Send_Dialer_error_mail__c){
+                        activityLogs = NotificationAlertError.sendEmailNotification(activityLogs ,  'Exception occured in dialer integration UPES ',  e.getMessage() );
+                    }
+                    insert activityLogs;
+                }
+
+
+            }//end of if datalist
+
+
+        } // end of if run anp
+    } //End of method
+
+
+}
